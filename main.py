@@ -1,84 +1,65 @@
 import os
-import re
-import pdfplumber
-import uvicorn
-from io import BytesIO
-from fastapi import FastAPI, Header, HTTPException, UploadFile, File
+import asyncio
+from fastapi import FastAPI, Header, HTTPException, Depends
 from playwright.async_api import async_playwright
 
-app = FastAPI(title="JurisExtract API")
+app = FastAPI(title="JurisExtract Pro")
 
-# Security: This must match the Secret Header in your RapidAPI Dashboard
-RAPID_SECRET = os.getenv("RAPID_PROXY_SECRET", "default_secret_for_local_testing")
+# --- Security Layer ---
+# This ensures only RapidAPI can talk to your Railway server.
+RAPID_PROXY_SECRET = os.getenv("RAPID_PROXY_SECRET")
 
-# --- CITATION PARSER ---
-class PrecedentParser:
-    def __init__(self):
-        # Regex for common US legal citations
-        self.cite_pattern = re.compile(
-            r'(\d+\s+U\.S\.\s+\d+)|(\d+\s+F\.\d?d\s+\d+)|(\d+\s+U\.S\.C\.\s+§+\s+\d+)'
-        )
+async def verify_rapid_request(x_rapidapi_proxy_secret: str = Header(None)):
+    if x_rapidapi_proxy_secret != RAPID_PROXY_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden: Unverified Request")
+    return x_rapidapi_proxy_secret
 
-    def get_toa_data(self, pdf_bytes):
-        citations = set()
-        with pdfplumber.open(pdf_bytes) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    # Look specifically for the Table of Authorities section
-                    matches = self.cite_pattern.findall(text)
-                    for match in matches:
-                        # Extract the non-empty group from the regex match
-                        cite = next(group for group in match if group)
-                        citations.add(cite.strip())
-        return sorted(list(citations))
+# --- Scraper Logic ---
+@app.get("/scrape-docket", dependencies=[Depends(verify_rapid_request)])
+async def scrape_docket(court: str, docket_id: str):
+    # Map 'court' to actual URLs
+    court_map = {
+        "scotus": f"https://www.supremecourt.gov/docket/docketfiles/html/public/{docket_id}.html"
+    }
+    
+    url = court_map.get(court.lower())
+    if not url:
+        return {"success": False, "error": f"Court '{court}' not supported."}
 
-parser = PrecedentParser()
+    try:
+        async with async_playwright() as p:
+            # 1. Launch with optimized flags for Railway's limited resources
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            )
+            
+            # 2. Set a strict timeout (RapidAPI expects a response within 30-180s)
+            context = await browser.new_context(user_agent="Mozilla/5.0 Legal-Scraper/1.0")
+            page = await context.new_page()
+            page.set_default_timeout(20000) # 20 seconds
+            
+            # 3. Execution
+            response = await page.goto(url, wait_until="domcontentloaded")
+            
+            if response.status == 404:
+                return {"success": False, "error": "Docket not found."}
 
-# --- ENDPOINTS ---
+            # Extract specific metadata
+            data = {
+                "court": court,
+                "docket_id": docket_id,
+                "case_name": await page.title(),
+                "status": "Success",
+                "captured_url": page.url
+            }
+            
+            await browser.close()
+            return data
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 @app.get("/")
-def health_check():
-    return {"status": "online", "message": "JurisExtract Legal API is running"}
-
-@app.post("/extract-precedent")
-async def extract_precedent(
-        file: UploadFile = File(...),
-        x_rapidapi_proxy_secret: str = Header(None)
-):
-    # Verify the request is coming from RapidAPI
-    if x_rapidapi_proxy_secret != RAPID_SECRET:
-        raise HTTPException(status_code=403, detail="Unauthorized access")
-
-    contents = await file.read()
-    results = parser.get_toa_data(BytesIO(contents))
-
-    return {
-        "filename": file.filename,
-        "citation_count": len(results),
-        "precedents": results
-    }
-
-@app.get("/scrape-docket/{court}/{docket_id}")
-async def fetch_docket(
-        court: str,
-        docket_id: str,
-        x_rapidapi_proxy_secret: str = Header(None)
-):
-    if x_rapidapi_proxy_secret != RAPID_SECRET:
-        raise HTTPException(status_code=403, detail="Unauthorized access")
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        # Conceptual URL - replace with the specific court's search portal
-        target_url = f"https://www.{court}.uscourts.gov/search?q={docket_id}"
-        await page.goto(target_url)
-        title = await page.title()
-        await browser.close()
-
-    return {"court": court, "docket": docket_id, "summary": title}
-
-if __name__ == "__main__":
-    # Runs the server on port 8000
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+async def health():
+    return {"status": "online", "engine": "playwright-chromium"}
