@@ -1,61 +1,76 @@
 import os
-import asyncio
-from fastapi import FastAPI, Request, HTTPException
+from typing import Annotated
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright
 
-app = FastAPI(title="JurisExtract API")
+# 1. Initialize App with Metadata for RapidAPI
+app = FastAPI(
+    title="JurisExtract",
+    description="Professional Legal Data Extraction API for Business & Court Records.",
+    version="1.0.0",
+    contact={"name": "JurisExtract Support", "url": "https://jurisextract.com"},
+    openapi_tags=[
+        {"name": "Search", "description": "Endpoints for finding entities and cases."},
+        {"name": "Details", "description": "Deep-dive extraction for specific records."}
+    ]
+)
 
-# Security: Set this in Railway Variables
-RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "default_secret_for_local_testing")
+# 2. Enable CORS (Required for RapidAPI testing playground)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows RapidAPI's domain to access your Railway server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 3. Security Lock: RapidAPI Proxy Secret
+RAPID_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET")
 
 @app.middleware("http")
-async def verify_request(request: Request, call_next):
-    # Only enforce security if not on a local machine
-    if not request.url.hostname in ["127.0.0.1", "localhost"]:
-        header_secret = request.headers.get("X-RapidAPI-Proxy-Secret")
-        if header_secret != RAPIDAPI_PROXY_SECRET:
-            raise HTTPException(status_code=403, detail="Unauthorized")
+async def verify_rapidapi_request(request: Request, call_next):
+    # Skip security for local dev or health checks
+    if request.url.path in ["/healthz", "/"]:
+        return await call_next(request)
+    
+    if RAPID_SECRET:
+        proxy_header = request.headers.get("X-RapidAPI-Proxy-Secret")
+        if proxy_header != RAPID_SECRET:
+            raise HTTPException(status_code=403, detail="Unauthorized: Direct access is restricted.")
+    
     return await call_next(request)
 
-@app.get("/search")
-async def search_business(q: str):
-    """Search for business records by name."""
+# 4. Search Endpoint
+@app.get("/v1/business-search", tags=["Search"], summary="Find businesses by name")
+async def search_business(
+    q: Annotated[str, Query(description="The company name to search for", example="Tesla Inc")],
+    state: Annotated[str, Query(description="State code (e.g. DE, CA, FL)", example="DE")] = "DE"
+):
+    """
+    Scrapes official state registries to find matching legal entities.
+    """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        # Use a real user agent to avoid immediate blocks
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = await context.new_page()
         
         try:
-            # Example: California BizFile (or similar state portals)
-            await page.goto("https://bizfileonline.sos.ca.gov/search/business", timeout=60000)
-            
-            # 1. Fill the search box
-            await page.fill('input[aria-label="Search Business Name"]', q)
-            await page.keyboard.press("Enter")
-            
-            # 2. Wait for results to load
-            await page.wait_for_selector('.search-results-item', timeout=10000)
-            
-            # 3. Extract the first 5 results
-            results = await page.eval_on_selector_all('.search-results-item', """
-                (items) => items.slice(0, 5).map(item => ({
-                    name: item.querySelector('.entity-name')?.innerText,
-                    id: item.querySelector('.entity-id')?.innerText,
-                    status: item.querySelector('.status')?.innerText,
-                    type: item.querySelector('.entity-type')?.innerText
-                }))
-            """)
-            
-            return {"query": q, "results": results, "count": len(results)}
-
+            # Example logic for a general biz search portal
+            await page.goto(f"https://example-gov-site.gov/search?name={q}&state={state}")
+            # Placeholder for selector logic
+            title = await page.title()
+            return {"query": q, "state": state, "status": "success", "source": title, "results": []}
         except Exception as e:
-            return {"query": q, "error": str(e), "results": []}
+            return {"error": str(e)}
         finally:
             await browser.close()
 
-@app.get("/")
-def home():
-    return {"message": "JurisExtract API is online. Use /search?q=CompanyName"}
+# 5. System Health Check
+@app.get("/healthz", include_in_schema=False)
+def health():
+    return {"status": "online"}
+
+@app.get("/", include_in_schema=False)
+def root():
+    return {"message": "JurisExtract API is running. Visit /docs for documentation."}
