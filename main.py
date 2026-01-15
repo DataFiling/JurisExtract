@@ -1,15 +1,14 @@
 import os
 import asyncio
-from typing import Annotated, List
+from typing import Annotated
 from fastapi import FastAPI, Request, HTTPException, Query, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright
 
-# --- INITIALIZATION ---
 app = FastAPI(
     title="JurisExtract",
-    description="Real-time Legal & Business Intelligence Scraper.",
-    version="1.1.0",
+    description="Legal Entity Scraper for the Delaware ICIS Registry.",
+    version="1.2.1"
 )
 
 app.add_middleware(
@@ -27,82 +26,92 @@ RAPID_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET")
 async def verify_rapidapi_request(request: Request, call_next):
     if request.url.path in ["/healthz", "/", "/docs", "/openapi.json"]:
         return await call_next(request)
-    
-    if RAPID_SECRET:
-        proxy_header = request.headers.get("X-RapidAPI-Proxy-Secret")
-        if proxy_header != RAPID_SECRET:
-            raise HTTPException(status_code=403, detail="Unauthorized.")
-    
+    if RAPID_SECRET and request.headers.get("X-RapidAPI-Proxy-Secret") != RAPID_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized.")
     return await call_next(request)
 
-# --- SCRAPING ENGINE ---
-async def scrape_delaware_icis(query: str):
-    """
-    Targets the Delaware Division of Corporations (ICIS) Search.
-    """
+# --- THE ENGINE ---
+
+async def scrape_de_search(query: str):
     async with async_playwright() as p:
-        # Launch with automation bypass
-        browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+        # Launch with stealth arguments
+        browser = await p.chromium.launch(
+            headless=True, 
+            args=["--disable-blink-features=AutomationControlled"]
+        )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={'width': 1280, 'height': 800}
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
         
         try:
-            # Navigate to the Search Page
+            # 1. Navigate to Delaware ICIS
             url = "https://icis.corp.delaware.gov/ecorp/entitysearch/namesearch.aspx"
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(url, wait_until="networkidle", timeout=30000)
             
-            # Fill the search field (using name-based selector for ICIS)
-            # The field usually has an ID containing 'frmEntityName'
-            search_input = page.locator('input[name*="frmEntityName"]')
+            # 2. Interact with the 'Entity Name' field
+            # We use a CSS selector that targets the partial ID used by ASP.NET
+            search_input = page.locator('input[id*="frmEntityName"]')
             await search_input.wait_for(state="visible")
+            
+            # Mimic human typing speed
+            await search_input.click()
             await search_input.fill(query)
+            await asyncio.sleep(0.5) 
             
-            # Click the Search button
-            await page.click('input[name*="btnSubmit"]')
+            # 3. Click the Search button
+            submit_btn = page.locator('input[id*="btnSubmit"]')
+            await submit_btn.click()
             
-            # Wait for results table to load
-            # ICIS results table ID starts with 'gvResults'
-            results_table_selector = 'table[id*="gvResults"]'
+            # 4. Wait for the results table (gvResults)
+            # If this fails, it usually means 'No Results Found' or a Bot Block
             try:
-                await page.wait_for_selector(results_table_selector, timeout=10000)
-            except:
-                return [] # No results found or timeout
-
-            # Parse the rows
-            rows = await page.locator(f'{results_table_selector} tr').all()
-            parsed_results = []
-            
-            # Index 0 is the header, so we skip it
-            for row in rows[1:]:
-                cells = await row.locator('td').all_inner_texts()
-                if len(cells) >= 2:
-                    parsed_results.append({
-                        "file_number": cells[0].strip(),
-                        "entity_name": cells[1].strip(),
-                        "status": "Search Hit",
-                        "state": "DE"
-                    })
-            
-            return parsed_results
+                table_selector = 'table[id*="gvResults"]'
+                await page.wait_for_selector(table_selector, timeout=15000)
+                
+                rows = await page.locator(f"{table_selector} tr").all()
+                results = []
+                
+                # Skip header row [0]
+                for row in rows[1:]:
+                    cells = await row.locator('td').all_inner_texts()
+                    if len(cells) >= 2:
+                        results.append({
+                            "file_number": cells[0].strip(),
+                            "entity_name": cells[1].strip(),
+                            "status": "Found",
+                            "state": "DE"
+                        })
+                return results
+                
+            except Exception:
+                # Check if the page explicitly says no records found
+                content = await page.content()
+                if "No Records Found" in content:
+                    return []
+                # Otherwise, it might be a block
+                return [{"error": "Search timed out or was blocked by the registry."}]
 
         except Exception as e:
-            print(f"Scrape internal error: {e}")
-            return []
+            return [{"error": str(e)}]
         finally:
             await browser.close()
 
-# --- API ROUTES ---
+# --- ROUTES ---
+
 v1 = APIRouter(prefix="/v1")
 
-@v1.get("/business-search", tags=["Search"], summary="Live Delaware Registry Search")
-async def business_search(
-    q: Annotated[str, Query(description="The legal name to search for", example="Tesla")]
+@v1.get("/business-search", tags=["Search"])
+async def search(
+    q: Annotated[str, Query(description="The legal name to search (e.g., Tesla)", example="Tesla")]
 ):
-    """Hits the Delaware ICIS portal in real-time to retrieve File Numbers and Entity Names."""
-    data = await scrape_delaware_icis(q)
+    """Hits the Delaware ICIS portal in real-time."""
+    data = await scrape_de_search(q)
+    
+    # Check if we got an error message back
+    if data and "error" in data[0]:
+        return {"status": "error", "message": data[0]["error"], "results": []}
+        
     return {
         "query": q,
         "count": len(data),
@@ -110,16 +119,10 @@ async def business_search(
         "results": data
     }
 
-@v1.get("/business-details/{file_number}", tags=["Details"])
-async def get_details(file_number: str):
-    """Retrieve detailed agent info using the File Number."""
-    return {"file_number": file_number, "message": "Deep extraction endpoint ready."}
-
 app.include_router(v1)
 
-# --- SYSTEM ---
 @app.get("/healthz", include_in_schema=False)
 def health(): return {"status": "online"}
 
 @app.get("/", include_in_schema=False)
-def root(): return {"message": "JurisExtract is active."}
+def root(): return {"message": "JurisExtract API is online."}
